@@ -5,6 +5,22 @@ live prices as fast-moving (re-baseline before each cohort).
 """
 from __future__ import annotations
 
+import math
+
+
+# Synthetic planning assumptions, not live provider SLAs.  These deliberately
+# vary by GPU so that spot risk is priced instead of treating every market as
+# equally reliable.  Re-baseline from the target provider before purchasing.
+SPOT_INTERRUPTION_RATE_BY_GPU = {
+    "H100": 0.03,
+    "H200": 0.04,
+    "A100": 0.06,
+    "A10G": 0.10,
+    "L4": 0.08,
+    "B200": 0.05,
+    "MI300X": 0.07,
+}
+
 
 def request_cost(
     input_tok: int,
@@ -60,21 +76,93 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
-    """Pick a purchasing tier from a workload's duty cycle + interruptibility.
+def cache_break_even_reads(
+    write_cost_per_m: float,
+    price_in_per_m: float,
+    read_discount: float = 0.10,
+) -> float:
+    """Return cache reads needed for read savings to repay one cache write.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+    ``write_cost_per_m`` is the incremental cache-creation charge per million
+    cached tokens.  A normal uncached read costs ``price_in_per_m``; a cached
+    read costs ``read_discount`` of that amount.
+    """
+    saved_per_read = price_in_per_m * (1.0 - read_discount)
+    if write_cost_per_m <= 0:
+        return 0.0
+    if saved_per_read <= 0:
+        return math.inf
+    return write_cost_per_m / saved_per_read
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    price_in_per_m: float = 1.0,
+) -> bool:
+    """Whether repeated-read savings strictly exceed cache-write cost."""
+    return avg_cache_reads > cache_break_even_reads(
+        write_cost_per_m, price_in_per_m, read_discount
+    )
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    *,
+    gpu_type: str | None = None,
+    job_days: int | None = None,
+    on_demand_hr: float | None = None,
+    spot_hr: float | None = None,
+    reserved_1yr_hr: float | None = None,
+    reserved_3yr_hr: float | None = None,
+    return_details: bool = False,
+) -> str | dict:
+    """Pick a purchasing tier using duty cycle, duration, and spot risk.
+
+    The optional price inputs enable the extended policy.  Spot is selected
+    only when its interruption-adjusted hourly cost beats on-demand.  Stable
+    high-duty work uses a 1-year rate for jobs shorter than three years and a
+    3-year rate only when the supplied duration covers that commitment.
+
+    The plain string return keeps the original public API compatible.  M3 asks
+    for details to obtain ``rate_plan`` and the interruption assumption.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
-    if interruptible and hours_per_day < 24:
-        return "spot"
-    if duty >= be:
-        return "reserved"
-    return "on_demand"
+    rate = SPOT_INTERRUPTION_RATE_BY_GPU.get(gpu_type or "", 0.05)
+    spot_effective_hr = None
+
+    if spot_hr is not None:
+        spot_effective_hr = spot_hr * (1.03 + rate * 0.5)
+
+    if interruptible and hours_per_day < 24 and (
+        on_demand_hr is None or spot_effective_hr is None or spot_effective_hr < on_demand_hr
+    ):
+        tier, rate_plan = "spot", "spot"
+    elif duty >= be:
+        tier = "reserved"
+        # Do not claim a 3-year price for a workload whose known horizon is
+        # shorter.  With no detailed prices, retain legacy behavior.
+        if job_days is not None and reserved_1yr_hr is not None:
+            use_3yr = job_days >= 3 * 365 and reserved_3yr_hr is not None
+            rate_plan = "reserved_3yr" if use_3yr else "reserved_1yr"
+        else:
+            rate_plan = "reserved_3yr"
+    else:
+        tier, rate_plan = "on_demand", "on_demand"
+
+    if not return_details:
+        return tier
+    return {
+        "tier": tier,
+        "rate_plan": rate_plan,
+        "interruption_rate": rate,
+        "spot_effective_hr": spot_effective_hr,
+        "duty_cycle": duty,
+    }
 
 
 def spot_checkpoint_cost(
